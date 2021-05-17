@@ -461,12 +461,12 @@ def train():
    train_data, batch_size=args.batchsize, shuffle=True, num_workers=8
   )
 
-  # test_data = KodakDataset(
-  #   'images', Preprocess()
-  # )
-  # testing_loader = torch.utils.data.DataLoader(
-  #   test_data, batch_size=2, shuffle=False, num_workers=1
-  # )
+  test_data = KodakDataset(
+    'images', Preprocess()
+  )
+  testing_loader = torch.utils.data.DataLoader(
+    test_data, batch_size=2, shuffle=False, num_workers=1
+  )
 
   net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
   def weight_init(m):

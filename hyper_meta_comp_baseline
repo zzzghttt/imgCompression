@@ -1,0 +1,825 @@
+import argparse
+import glob
+
+import numpy as np
+import torch
+import torchvision as tv
+import torchvision.datasets
+from torch import nn, optim
+import torch.nn.functional as F
+
+# from skimage.measure import compare_psnr as psnr
+
+import pickle
+from PIL import Image
+
+from torch.autograd import Function
+import time
+import os
+
+from gdn import GDN,IGDN
+#import translate_weights
+
+# torch.backends.cudnn.enabled = False
+class DIV2KDataset(torch.utils.data.Dataset):
+  def __init__(self, train_glob, transform):
+    super(DIV2KDataset, self).__init__()
+    self.transform = transform
+    self.images = list(sorted(glob.glob(train_glob)))
+    
+  def __getitem__(self, idx):
+    img_path = self.images[idx]
+    img = Image.open(img_path).convert("RGB")
+    img = self.transform(img)
+    return img
+  
+  def __len__(self):
+    return len(self.images)
+
+class KodakDataset(torch.utils.data.Dataset):
+  def __init__(self, kodak_fn, transform):
+    super(KodakDataset, self).__init__()
+    self.transform = transform
+    self.kodak = torchvision.datasets.CIFAR10(kodak_fn, train=True, download=True, transform=torchvision.transforms.ToTensor())
+
+    #self.kodak = np.load(kodak_fn)
+  
+  def __getitem__(self, idx):
+    img = self.kodak[idx][0]
+
+    img = img[:,:,[2,1,0]]
+
+    img = self.transform(img)
+    return img
+  
+  def __len__(self):
+    return len(self.kodak)
+
+class Preprocess(object):
+  def __init__(self):
+    pass
+
+  def __call__(self, PIL_img):
+    img = np.asarray(PIL_img, dtype=np.float32)
+    img /= 127.5
+    img -= 1.0
+    return img.transpose((2, 0, 1))
+    
+def quantize_image(img):
+  img = torch.clamp(img, -1, 1)
+  img += 1
+  img = torch.round(img)
+  img = img.to(torch.uint8)
+  return img
+
+class analysisTransformModel(nn.Module):
+  def __init__(self, in_dim, num_filters, conv_trainable=True, device=torch.device('cuda')):
+    super(analysisTransformModel, self).__init__()
+    self.transform = nn.Sequential(
+      nn.Conv2d(in_dim, num_filters[0], 5, 2, 2),
+      GDN(num_filters[0], device),
+      nn.Conv2d(num_filters[0], num_filters[1], 5, 2, 2),
+      GDN(num_filters[1], device),
+      nn.Conv2d(num_filters[1], num_filters[2], 5, 2, 2),
+      GDN(num_filters[2], device),
+      nn.Conv2d(num_filters[2], num_filters[3], 5, 2, 2),
+    )
+    
+  def forward(self, inputs):
+    x = self.transform(inputs)
+    return x
+
+class synthesisTransformModel(nn.Module):
+  def __init__(self, in_dim, num_filters, conv_trainable=True, device=torch.device('cuda')):
+    super(synthesisTransformModel, self).__init__()
+    self.transform = nn.Sequential(
+      nn.ConvTranspose2d(in_dim, num_filters[0], 5, 2, 2, output_padding=1),
+      IGDN(num_filters[0], device),
+      nn.ConvTranspose2d(num_filters[0], num_filters[1], 5, 2, 2, output_padding=1),
+      IGDN(num_filters[1], device),
+      nn.ConvTranspose2d(num_filters[1], num_filters[2], 5, 2, 2, output_padding=1),
+      IGDN(num_filters[2], device),
+      nn.ConvTranspose2d(num_filters[2], num_filters[3], 5, 2, 2, output_padding=1),
+    )
+    
+  def forward(self, inputs):
+    x = self.transform(inputs)
+    return x
+
+class Space2Depth(nn.Module):
+  def __init__(self, r):
+    super(Space2Depth, self).__init__()
+    self.r = r
+  
+  def forward(self, x):
+    r = self.r
+    b, c, h, w = x.size()
+    out_c = c * (r**2)
+    out_h = h//2
+    out_w = w//2
+    x_view = x.view(b, c, out_h, r, out_w, r)
+    x_prime = x_view.permute(0,3,5,1,2,4).contiguous().view(b, out_c, out_h, out_w)
+    return x_prime
+
+class Depth2Space(nn.Module):
+  def __init__(self, r):
+    super(Depth2Space, self).__init__()
+    self.r = r
+  def forward(self, x):
+    r = self.r
+    b, c, h, w = x.size()
+    out_c = c // (r**2)
+    out_h = h * 2
+    out_w = w * 2
+    x_view = x.view(b, r, r, out_c, h, w)
+    x_prime = x_view.permute(0,3,4,1,5,2).contiguous().view(b, out_c, out_h, out_w)
+    return x_prime
+
+class h_analysisTransformModel(nn.Module):
+  def __init__(self, in_dim, num_filters, strides_list, conv_trainable=True):
+    super(h_analysisTransformModel, self).__init__()
+    self.transform = nn.Sequential(
+      nn.Conv2d(in_dim,         num_filters[0], 3, strides_list[0], 1),
+      nn.ReLU(),
+      nn.Conv2d(num_filters[0], num_filters[1], 5, strides_list[1], 2),
+      nn.ReLU(),
+      nn.Conv2d(num_filters[1], num_filters[2], 5, strides_list[2], 2)
+    )
+    
+  def forward(self, inputs):
+    x = torch.abs(inputs)
+    x = self.transform(x)
+    return x
+
+class h_synthesisTransformModel(nn.Module):
+  def __init__(self, in_dim, num_filters, strides_list, conv_trainable=True):
+    super(h_synthesisTransformModel, self).__init__()
+    self.transform = nn.Sequential(
+      nn.ConvTranspose2d(in_dim,         num_filters[0], 5, strides_list[0], 2, output_padding=1),
+      nn.ReLU(),
+      nn.ConvTranspose2d(num_filters[0], num_filters[1], 5, strides_list[1], 2, output_padding=1),
+      nn.ReLU(),
+      nn.ConvTranspose2d(num_filters[1], num_filters[2], 3, strides_list[2], 1),
+    )
+  
+  def forward(self, inputs):
+    x = self.transform(inputs)
+    return x
+
+class BlockSample(nn.Module):
+  def __init__(self, in_shape, masked=True, device=torch.device('cuda')):
+    super(BlockSample, self).__init__()
+    self.masked = masked
+    dim = in_shape[1]
+    flt = np.zeros((dim*16, dim, 7, 7), dtype=np.float32)
+    for i in range(0, 4):
+      for j in range(0, 4):
+        if self.masked:
+          if i == 3:
+            if j == 2 or j == 3:
+              break
+        for k in range(0,dim):
+          s = k*16 + i * 4 + j
+          flt[s, k, i, j+1] = 1
+    flt_tensor = torch.Tensor(flt).float().to(device)
+    self.register_buffer('sample_filter', flt_tensor)
+  
+  def forward(self, inputs):
+    t = F.conv2d(inputs, self.sample_filter, padding=3)
+    b, c, h, w = inputs.size()
+    t = t.contiguous().view(b, c, 4, 4, h, w).permute(0, 4, 5, 1, 2, 3)
+    t = t.contiguous().view(b*h*w, c, 4, 4)
+    return t
+
+class NeighborSample(nn.Module):
+  def __init__(self, in_shape):
+    super(NeighborSample, self).__init__()
+    dim = in_shape[1]
+    flt = np.zeros((dim*25, dim, 5, 5), dtype=np.float32)
+    for i in range(0, 5):
+      for j in range(0, 5):
+        for k in range(0, dim):
+          s = k*25 + i * 5 + j
+          flt[s, k, i, j] = 1
+    flt_tensor = torch.Tensor(flt).float().cuda()
+    self.register_buffer('sample_filter', flt_tensor)
+  
+  def forward(self, inputs):
+    t = F.conv2d(inputs, self.sample_filter, padding=2)
+    b, c, h, w = inputs.size()
+    t = t.contiguous().view(b, c, 5, 5, h, w).permute(0, 4, 5, 1, 2, 3)
+    t = t.contiguous().view(b*h*w, c, 5, 5)
+    return t
+  
+class GaussianModel(nn.Module):
+  def __init__(self):
+    super(GaussianModel, self).__init__()
+    
+    self.m_normal_dist = torch.distributions.normal.Normal(0., 1.)
+    # self.register_buffer('m_normal_dist', flt_tensor)
+
+  def _cumulative(self, inputs, stds, mu):
+    half = 0.5
+    eps = 1e-6
+    upper = (inputs - mu + half) / (stds)
+    lower = (inputs - mu - half) / (stds)
+    cdf_upper = self.m_normal_dist.cdf(upper)
+    cdf_lower = self.m_normal_dist.cdf(lower)
+    res = cdf_upper - cdf_lower
+    return res
+  
+  def forward(self, inputs, hyper_sigma, hyper_mu):
+    likelihood = self._cumulative(inputs, hyper_sigma, hyper_mu)
+    likelihood_bound = 1e-8
+    likelihood = torch.clamp(likelihood, min=likelihood_bound)
+    return likelihood
+    
+class PredictionModel_Context(nn.Module):
+  def __init__(self, in_dim, dim=192, trainable=True, outdim=None):
+    super(PredictionModel_Context, self).__init__()
+    if outdim is None:
+      outdim = dim
+    self.transform = nn.Sequential(
+      nn.Conv2d(in_dim, dim, 3, 1, 1),
+      nn.LeakyReLU(0.2),
+      nn.Conv2d(dim, dim, 3, 2, 1),
+      nn.LeakyReLU(0.2),
+      nn.Conv2d(dim, dim, 3, 1, 1),
+      nn.LeakyReLU(0.2)
+    )
+    self.fc = nn.Linear(dim*2*2, outdim)
+    self.flatten = nn.Flatten()
+    
+  def forward(self, y_rounded, h_tilde, y_sampler, h_sampler):
+    b, c, h, w = y_rounded.size()
+    y_sampled = y_sampler(y_rounded)
+    h_sampled = h_sampler(h_tilde)
+    merged = torch.cat([y_sampled, h_sampled], 1)
+    y_context = self.transform(merged)
+    y_context = self.flatten(y_context)
+    y_context = self.fc(y_context)
+    hyper_mu = y_context[:, :c]
+    hyper_mu = hyper_mu.view(b, h, w, c).permute(0, 3, 1, 2)
+    hyper_sigma = y_context[:, c:]
+    hyper_sigma = torch.exp(hyper_sigma)
+    hyper_sigma = hyper_sigma.contiguous().view(b, h, w, c).permute(0, 3, 1, 2)
+
+    return hyper_mu, hyper_sigma
+
+class PredictionModel(nn.Module):
+  def __init__(self, in_dim, dim=192, trainable=True, outdim=None):
+    super(PredictionModel, self).__init__()
+    if outdim is None:
+      outdim = dim
+    self.transform = nn.Sequential(
+      nn.Conv2d(in_dim, dim, 3, 1, 1),
+      nn.LeakyReLU(0.2),
+      nn.Conv2d(dim, dim, 3, 2, 1),
+      nn.LeakyReLU(0.2),
+      nn.Conv2d(dim, dim, 3, 1, 1),
+      nn.LeakyReLU(0.2)
+    )
+    self.fc = nn.Linear(dim*2*2, outdim)
+    self.flatten = nn.Flatten()
+    
+  def forward(self, y_shape, h_tilde, h_sampler):
+    b, c, h, w = y_shape
+    h_sampled = h_sampler(h_tilde)
+    merged = h_sampled
+    y_context = self.transform(merged)
+    y_context = self.flatten(y_context)
+    y_context = self.fc(y_context)
+    hyper_mu = y_context[:, :c]
+    hyper_mu = hyper_mu.view(b, h, w, c).permute(0, 3, 1, 2)
+    hyper_sigma = y_context[:, c:]
+    hyper_sigma = torch.exp(hyper_sigma)
+    hyper_sigma = hyper_sigma.contiguous().view(b, h, w, c).permute(0, 3, 1, 2)
+
+    return hyper_mu, hyper_sigma
+
+
+class conv_generator(nn.Module):
+    def __init__(self,in_dim,out_dim):
+        super(conv_generator,self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.fc = nn.Linear(16*16*16, in_dim*out_dim*3*3)
+
+    def forward(self,x):
+        b,_,_,_ = x.shape
+        x = x.view(b,-1)
+        
+        weights = self.fc(x)
+        weights = weights.view(b, self.out_dim,self.in_dim,3,3)
+
+        return weights
+
+
+class BypassRound(Function):
+  @staticmethod
+  def forward(ctx, inputs):
+    return torch.round(inputs)
+
+  @staticmethod
+  def backward(ctx, grad_output):
+    return grad_output
+
+bypass_round = BypassRound.apply
+class Net(nn.Module):
+  def __init__(self, train_size, test_size, device=torch.device('cuda')):
+    super(Net, self).__init__()
+    self.train_size = train_size
+    self.test_size = test_size
+    self.a_model = analysisTransformModel(3, [192, 192, 192, 192], device=device)
+    self.s_model = synthesisTransformModel(192, [192, 192, 192, 16], device=device)
+    # self.conv_weights_gen = conv_generator(in_dim=16,out_dim=3)
+    self.origin_conv = nn.Conv2d(16,3, 3,1,1)
+
+    self.ha_model = h_analysisTransformModel(192, [192, 192, 192], [1, 2, 2])
+    self.hs_model = h_synthesisTransformModel(192, [192, 192, 192], [2, 2, 1])
+
+    self.entropy_bottleneck_z2 = GaussianModel()
+    self.entropy_bottleneck_z3 = GaussianModel()
+    b, h, w, c = train_size
+    tb, th, tw, tc = test_size
+
+    # self.v_z2_sigma = torch.ones((1,192,1,1), dtype=torch.float32, requires_grad=True)
+
+    # self.register_buffer('z2_sigma', self.v_z2_sigma)
+
+    self.v_z2_sigma = nn.Parameter(torch.ones((1,192,1,1), dtype=torch.float32, requires_grad=True))
+
+    self.register_parameter('z2_sigma', self.v_z2_sigma)
+
+    self.prediction_model_no_context = PredictionModel(in_dim=192, dim=192, outdim=384)
+    
+    # self.y_sampler = BlockSample((b,192,h//8,w//8))
+    self.h_sampler = BlockSample((b, 192,h//8,w//8), False)
+    # self.test_y_sampler = BlockSample((b,192,h//8,w//8))
+    self.test_h_sampler = BlockSample((b,192,h//8,w//8), False)
+
+
+  def forward(self, inputs, mode='train'):
+    b, h, w, c = self.train_size
+    tb, th, tw, tc = self.test_size
+    
+    z3 = self.a_model(inputs)
+
+    noise = torch.rand_like(z3) - 0.5
+    z3_noisy = z3 + noise
+    z3_rounded = bypass_round(z3)
+
+    z2 = self.ha_model(z3_rounded)
+    
+    noise = torch.rand_like(z2) - 0.5
+    z2_noisy = z2 + noise
+    z2_rounded = bypass_round(z2)
+
+    h2 = self.hs_model(z2_rounded)
+    
+    z2_sigma = self.z2_sigma.cuda()
+    z2_mu = torch.zeros_like(z2_sigma)
+
+    if mode == 'train':
+      z2_likelihoods = self.entropy_bottleneck_z2(z2_noisy, z2_sigma, z2_mu)
+      
+      # z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.y_sampler, self.h_sampler)
+      z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.h_sampler)
+      z3_likelihoods = self.entropy_bottleneck_z3(z3_noisy, z3_sigma, z3_mu)
+    else:
+      z2_likelihoods = self.entropy_bottleneck_z2(z2_rounded, z2_sigma, z2_mu)
+      # z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.test_y_sampler, self.test_h_sampler)
+      z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.test_h_sampler)
+      z3_likelihoods = self.entropy_bottleneck_z3(z3_rounded, z3_sigma, z3_mu)
+
+    x_tilde = self.s_model(z3_rounded)
+    
+    # conv_weights = self.conv_weights_gen(z3_syntax)
+    # conv_weights = conv_weights + self.origin_conv.weight
+    # for b in range(inputs.size()[0]):
+    #     if b == 0:
+    #         rec = F.conv2d(x_tilde[b:b+1,:,:,:],conv_weights[b],stride=1,padding=1)
+    #     else:
+    #         rec = torch.cat((rec,F.conv2d(x_tilde[b:b+1,:,:,:],conv_weights[b],stride=1,padding=1)),0)
+    
+    x_tilde = self.origin_conv(x_tilde)
+    
+    # x_tilde = F.conv2d(x_tilde, conv_weights)
+
+    num_pixels = inputs.size()[0] * h * w
+
+    if mode == 'train':
+
+      bpp_list = [torch.sum(torch.log(l), [0,1,2,3]) / (-np.log(2) * num_pixels) for l in [z2_likelihoods, z3_likelihoods]]
+
+      train_bpp = bpp_list[0] + bpp_list[1]
+
+      train_mse = torch.mean((inputs - x_tilde) ** 2, [0,1,2,3])
+      train_mse *= 255**2
+
+      train_loss = args.lmbda * train_mse + train_bpp
+
+
+      return train_loss, train_bpp, train_mse
+    
+    elif mode == 'test':
+      test_num_pixels = inputs.size()[0] * inputs.size()[2] * inputs.size()[3]
+
+      eval_bpp = torch.sum(torch.log(z3_likelihoods), [0,1,2,3]) / (-np.log(2) * test_num_pixels) + torch.sum(torch.log(z2_likelihoods), [0,1,2,3]) / (-np.log(2) * test_num_pixels)
+
+      # Bring both images back to 0..255 range.
+      gt = torch.round((inputs + 1) * 127.5)
+      x_hat = torch.clamp((x_tilde + 1) * 127.5, 0, 255)
+      x_hat = torch.round(x_hat).float()
+      v_mse = torch.mean((x_hat - gt) ** 2, [1,2,3])
+      v_psnr = torch.mean(20 * torch.log10(255 / torch.sqrt(v_mse)), 0)
+      return eval_bpp, v_psnr
+
+    elif mode == 'test_whole':
+      test_num_pixels = inputs.size()[0] * inputs.size()[2] * inputs.size()[3]
+
+      eval_bpp = torch.sum(torch.log(z3_likelihoods), [0,1,2,3]) / (-np.log(2) * test_num_pixels) + torch.sum(torch.log(z2_likelihoods), [0,1,2,3]) / (-np.log(2) * test_num_pixels)
+
+      # Bring both images back to 0..255 range.
+      gt = torch.round((inputs + 1) * 127.5)
+      x_hat = torch.clamp((x_tilde + 1) * 127.5, 0, 255)
+      x_hat = torch.round(x_hat).float()
+      v_mse = torch.mean((x_hat - gt) ** 2, [1,2,3])
+      v_psnr = torch.mean(20 * torch.log10(255 / torch.sqrt(v_mse)), 0)
+      return eval_bpp, v_mse   
+
+def train():
+  device = torch.device('cuda:'+args.gpu_ids)
+
+  train_data = DIV2KDataset(
+    args.train_glob, transform=tv.transforms.Compose([
+      tv.transforms.RandomCrop(256),
+      Preprocess()
+    ])
+  )
+  training_loader = torch.utils.data.DataLoader(
+   train_data, batch_size=args.batchsize, shuffle=True, num_workers=8
+  )
+
+  # test_data = KodakDataset(
+  #   'images', Preprocess()
+  # )
+  # testing_loader = torch.utils.data.DataLoader(
+  #   test_data, batch_size=2, shuffle=False, num_workers=1
+  # )
+
+  net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
+  def weight_init(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Conv2d):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.constant_(m.bias, 0)
+  
+  if args.load_weights != "":
+    net.apply(weight_init)
+    net.load_state_dict(torch.load(args.load_weights),strict=False)
+  else:
+    net.apply(weight_init)
+  # org_torch_d = torch.load(args.load_weights)
+  # target_d = translate_weights.load_tf_weights(org_torch_d)
+  # net.load_state_dict(target_d, strict=True)
+  # opt = optim.Adam(net.parameters(), lr=1e-5)
+  # sch = optim.lr_scheduler.MultiStepLR(opt, [4000, 4500, 4750, 5000], 0.5)
+  # opt = optim.Adam(net.parameters(), lr=1e-4)
+  # sch = optim.lr_scheduler.MultiStepLR(opt, [600, 800, 1000, 1100], 0.5)
+  opt = optim.Adam(net.parameters(), lr=1e-4)
+  sch = optim.lr_scheduler.MultiStepLR(opt, [100], 0.5)
+  for epoch in range(1500,2000):
+    # net.train()
+    start_time = time.time()
+
+    list_train_loss = 0.
+    list_train_bpp = 0.
+    list_train_mse = 0.
+
+    cnt = 0
+    
+    for i, data in enumerate(training_loader, 0):
+
+      x = data.to(device)
+      opt.zero_grad()
+      train_loss, train_bpp, train_mse = net(x, 'train')
+
+      train_loss = train_loss.mean()
+      train_bpp = train_bpp.mean()
+      train_mse = train_mse.mean()
+
+      if np.isnan(train_loss.item()):
+        raise Exception('NaN in loss')
+
+      list_train_loss += train_loss.item()
+      list_train_bpp += train_bpp.item()
+      list_train_mse += train_mse.item()
+
+      train_loss.backward()
+      nn.utils.clip_grad_norm_(net.parameters(), 10)
+      opt.step()
+      cnt += 1
+
+    print('[Epoch %04d TRAIN] Loss: %.4f bpp: %.4f mse: %.4f  ' % (
+      epoch,
+      list_train_loss / cnt,
+      list_train_bpp / cnt,
+      list_train_mse / cnt
+      )
+    )
+    # import IPython
+    # IPython.embed()
+
+    with torch.no_grad():
+      list_eval_bpp = 0.
+      list_v_psnr = 0.
+      cnt = 0
+      for i, data in enumerate(testing_loader, 0):
+        eval_bpp, v_psnr = net(data.to(device), 'test')
+        # print(i,"psnr="+str(v_psnr.item()))
+        list_eval_bpp += eval_bpp.mean().item()
+        list_v_psnr += v_psnr.mean().item()
+        cnt += 1
+      
+      print('[Epoch %04d TEST] bpp: %.4f psnr: %.4f' % (
+        epoch,
+        list_eval_bpp / cnt, 
+        list_v_psnr / cnt
+        )
+      )
+    timestamp = time.time()
+    if epoch % 50 == 49:
+      print('[INFO] Saving')
+      if not os.path.isdir(args.checkpoint_dir):
+        os.mkdir(args.checkpoint_dir)
+      torch.save(net.state_dict(), '%s/%04d.ckpt' % (args.checkpoint_dir, epoch))
+
+
+def val():
+  device = torch.device('cuda:'+args.gpu_ids)
+  TUNE_ITERS = 50
+  LR = 1e-4
+
+
+  test_data = KodakDataset(
+    'images', Preprocess()
+  )
+  testing_loader = torch.utils.data.DataLoader(
+    test_data, batch_size=2, shuffle=False, num_workers=1
+  )
+  net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
+
+  opt_enc = optim.Adam(net.a_model.parameters(), lr=LR)
+  opt_meta = optim.Adam(net.conv_weights_gen.parameters(), lr=LR)
+
+ 
+  net.load_state_dict(torch.load(args.load_weights),strict=True)
+
+  with torch.no_grad():
+      list_eval_bpp = 0.
+      list_v_psnr = 0.
+      cnt = 0
+      for i, data in enumerate(testing_loader, 0):
+        eval_bpp, v_psnr = net(data.to(device), 'test')
+        
+        # print(i,"psnr="+str(v_psnr.item()))
+        list_eval_bpp += eval_bpp.mean().item()
+        list_v_psnr += v_psnr.mean().item()
+        cnt += 1
+      
+      print('[ORIGIN] bpp: %.4f psnr: %.4f' % (
+        list_eval_bpp / cnt, 
+        list_v_psnr / cnt
+        )
+      )
+  
+  # ENC_ONLY
+  list_eval_bpp = 0.
+  list_v_psnr = 0.
+  cnt = 0
+  for i, data in enumerate(testing_loader, 0):
+    net.load_state_dict(torch.load(args.load_weights),strict=True)
+
+    for iters in range(TUNE_ITERS):
+      train_loss, train_bpp, train_mse = net(data.to(device), 'train')
+      train_loss = train_loss.mean()
+      opt_enc.zero_grad()
+      train_loss.backward()
+      opt_enc.step()
+    
+    eval_bpp, v_psnr = net(data.to(device), 'test')
+    # print(i,"psnr="+str(v_psnr.item()))
+    list_eval_bpp += eval_bpp.mean().item()
+    list_v_psnr += v_psnr.mean().item()
+    cnt += 1
+  
+  print('[ENC_ONLY] bpp: %.4f psnr: %.4f' % (
+    list_eval_bpp / cnt, 
+    list_v_psnr / cnt
+    )
+  )
+
+
+  # ENC+META
+  list_eval_bpp = 0.
+  list_v_psnr = 0.
+  cnt = 0
+  for i, data in enumerate(testing_loader, 0):
+    net.load_state_dict(torch.load(args.load_weights),strict=True)
+
+    for iters in range(TUNE_ITERS):
+      train_loss, train_bpp, train_mse = net(data.to(device), 'train')
+      opt_enc.zero_grad()
+      opt_meta.zero_grad()
+      train_loss.backward()
+      opt_enc.step()
+      opt_meta.step()
+    
+    eval_bpp, v_psnr = net(data.to(device), 'test')
+    # print(i,"psnr="+str(v_psnr.item()))
+    list_eval_bpp += eval_bpp.mean().item()
+    list_v_psnr += v_psnr.mean().item()
+    cnt += 1
+  
+  print('[ENC+META] bpp: %.4f psnr: %.4f' % (
+    list_eval_bpp / cnt, 
+    list_v_psnr / cnt
+    )
+  )
+
+def test_kodak():
+  device = torch.device('cuda:'+args.gpu_ids)
+  TUNE_ITERS = 100
+
+  Kodak_path = "images"
+  
+ 
+  net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
+
+  opt_enc = optim.Adam(net.a_model.parameters(), lr=1e-5)
+
+  net.load_state_dict(torch.load(args.load_weights),strict=True)
+
+  with torch.no_grad():
+      list_eval_bpp = 0.
+      list_v_psnr = 0.
+      cnt = 0
+      for img_name in os.listdir(Kodak_path):
+        data = Image.open(os.path.join(Kodak_path,img_name))
+        data = tv.transforms.ToTensor()(data)
+        data = data.unsqueeze(0)
+        data = data*2 - 1
+
+        data_bpp = 0.0
+        data_mse = 0.0
+        assert data.shape[2]%256 == 0
+        assert data.shape[3]%256 == 0
+        data_cnt = 0
+        for h in range(0,data.shape[2],256):
+            for w in range(0,data.shape[3],256):
+                data_cnt += 1
+                sub_data = data[:,:,h:h+256,w:w+256]
+                eval_bpp, v_mse = net(sub_data.to(device), 'test_whole')
+                data_bpp += eval_bpp
+                data_mse += v_mse
+        
+        assert data_cnt == 6
+
+        eval_bpp = data_bpp / data_cnt
+        data_mse = data_mse / data_cnt
+        v_psnr = torch.mean(20 * torch.log10(255 / torch.sqrt(data_mse)), 0)
+
+        # print(i,"psnr="+str(v_psnr.item()))
+        list_eval_bpp += eval_bpp.mean().item()
+        list_v_psnr += v_psnr.mean().item()
+        cnt += 1
+        print(img_name,eval_bpp.mean().item(),v_psnr.mean().item())
+      
+      print('[ORIGIN] bpp: %.4f psnr: %.4f' % (
+        list_eval_bpp / cnt, 
+        list_v_psnr / cnt
+        )
+      )
+  
+  # ENC_ONLY
+  # list_eval_bpp = 0.
+  # list_v_psnr = 0.
+  # cnt = 0
+  # for img_name in os.listdir(Kodak_path):
+    
+  #   data = Image.open(os.path.join(Kodak_path,img_name))
+  #   data = tv.transforms.ToTensor()(data)
+  #   data = data.unsqueeze(0)
+  #   data = data*2 - 1
+
+  #   data_bpp = 0.0
+  #   data_mse = 0.0
+  #   assert data.shape[2]%256 == 0
+  #   assert data.shape[3]%256 == 0
+  #   data_cnt = 0
+  #   for h in range(0,data.shape[2],256):
+  #       for w in range(0,data.shape[3],256):
+  #           data_cnt += 1
+  #           sub_data = data[:,:,h:h+256,w:w+256]
+  #           net.load_state_dict(torch.load(args.load_weights),strict=True)
+
+  #           for iters in range(TUNE_ITERS):
+  #               train_loss, train_bpp, train_mse = net(sub_data.to(device), 'train')
+  #               train_loss = train_loss.mean()
+  #               opt_enc.zero_grad()
+  #               train_loss.backward()
+  #               opt_enc.step()
+            
+  #           eval_bpp, v_mse = net(sub_data.to(device), 'test_whole')
+  #           data_bpp += eval_bpp
+  #           data_mse += v_mse
+    
+  #   assert data_cnt == 6
+
+  #   eval_bpp = data_bpp / data_cnt
+  #   data_mse = data_mse / data_cnt
+  #   v_psnr = torch.mean(20 * torch.log10(255 / torch.sqrt(data_mse)), 0)
+
+  #   # print(i,"psnr="+str(v_psnr.item()))
+  #   list_eval_bpp += eval_bpp.mean().item()
+  #   list_v_psnr += v_psnr.mean().item()
+  #   cnt += 1
+  #   print(img_name,eval_bpp.mean().item(),v_psnr.mean().item())
+  # print('[ENC_ONLY] bpp: %.4f psnr: %.4f' % (
+  #   list_eval_bpp / cnt, 
+  #   list_v_psnr / cnt
+  #   )
+  # )
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser(
+      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+  parser.add_argument(
+      "command", choices=["train", "compress", "decompress","val","test"],
+      help="What to do: 'train' loads training data and trains (or continues "
+           "to train) a new model. 'compress' reads an images file (lossless "
+           "PNG format) and writes a compressed binary file. 'decompress' "
+           "reads a binary file and reconstructs the images (in PNG format). "
+           "input and output filenames need to be provided for the latter "
+           "two options.")
+  parser.add_argument(
+      "input", nargs="?",
+      help="Input filename.")
+  parser.add_argument(
+      "output", nargs="?",
+      help="Output filename.")
+  parser.add_argument(
+      "--verbose", "-v", action="store_true",
+      help="Report bitrate and distortion when training or compressing.")
+  parser.add_argument(
+      "--num_filters", type=int, default=192,
+      help="Number of filters per layer.")
+  parser.add_argument(
+      "--checkpoint_dir", default="train",
+      help="Directory where to save/load model checkpoints.")
+  parser.add_argument(
+      "--train_glob", default="images/*.png",
+      help="Glob pattern identifying training data. This pattern must expand "
+           "to a list of RGB images in PNG format.")
+  parser.add_argument(
+      "--batchsize", type=int, default=2,
+      help="Batch size for training.")
+  parser.add_argument(
+      "--patchsize", type=int, default=256,
+      help="Size of images patches for training.")
+  parser.add_argument(
+      "--lambda", type=float, default=0.01, dest="lmbda",
+      help="Lambda for rate-distortion tradeoff.")
+  parser.add_argument(
+      "--last_step", type=int, default=1000000,
+      help="Train up to this number of steps.")
+  parser.add_argument(
+      "--preprocess_threads", type=int, default=16,
+      help="Number of CPU threads to use for parallel decoding of training "
+           "images.")
+  parser.add_argument(
+      "--test_ckpt", default="",
+      help="Testing ckpt path")
+  parser.add_argument(
+      "--l0MSE_ON", type=bool, default=False,
+      help="Whether to turn on l0 MSE"
+  )
+  parser.add_argument(
+      "--load_weights", default="",
+      help="Loaded weights")
+  parser.add_argument(
+      "--gpu_ids", type=str,default="0",
+      help="gpu_ids"
+  )
+  args = parser.parse_args()
+
+  if args.command == "train":
+    train()
+  if args.command == "val":
+    val()
+  if args.command == "test":
+    test_kodak()
+

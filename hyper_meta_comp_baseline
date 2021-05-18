@@ -40,15 +40,15 @@ class KodakDataset(torch.utils.data.Dataset):
   def __init__(self, kodak_fn, transform):
     super(KodakDataset, self).__init__()
     self.transform = transform
-    self.kodak = torchvision.datasets.CIFAR10(kodak_fn, train=True, download=True, transform=torchvision.transforms.ToTensor())
+    self.kodak = list(sorted(glob.glob(kodak_fn)))
 
     #self.kodak = np.load(kodak_fn)
   
   def __getitem__(self, idx):
-    img = self.kodak[idx][0]
-
-    img = img[:,:,[2,1,0]]
-
+    img_path = self.kodak[idx]
+    img = Image.open(img_path).convert("RGB")
+    # img = np.array(img, dtype=np.float32)
+    # img = img[:,:,[2,1,0]]
     img = self.transform(img)
     return img
   
@@ -458,17 +458,20 @@ def train():
     ])
   )
   training_loader = torch.utils.data.DataLoader(
-   train_data, batch_size=args.batchsize, shuffle=True, num_workers=8
+   train_data, batch_size=args.batchsize, shuffle=True, num_workers=1
   )
 
   test_data = KodakDataset(
-    'images', Preprocess()
+    'kodak/*.png', transform=tv.transforms.Compose([
+      tv.transforms.RandomCrop(256),
+      Preprocess()
+    ])
   )
   testing_loader = torch.utils.data.DataLoader(
     test_data, batch_size=2, shuffle=False, num_workers=1
   )
 
-  net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
+  net = Net((args.batchsize,256,256,3), (2,256,256,3)).to(device)
   def weight_init(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
@@ -491,7 +494,7 @@ def train():
   # sch = optim.lr_scheduler.MultiStepLR(opt, [600, 800, 1000, 1100], 0.5)
   opt = optim.Adam(net.parameters(), lr=1e-4)
   sch = optim.lr_scheduler.MultiStepLR(opt, [100], 0.5)
-  for epoch in range(1500,2000):
+  for epoch in range(1500,1600):
     # net.train()
     start_time = time.time()
 
@@ -543,10 +546,10 @@ def train():
         list_eval_bpp += eval_bpp.mean().item()
         list_v_psnr += v_psnr.mean().item()
         cnt += 1
-      
+
       print('[Epoch %04d TEST] bpp: %.4f psnr: %.4f' % (
         epoch,
-        list_eval_bpp / cnt, 
+        list_eval_bpp / cnt,
         list_v_psnr / cnt
         )
       )
@@ -565,7 +568,7 @@ def val():
 
 
   test_data = KodakDataset(
-    'images', Preprocess()
+    'kodak/*.png', Preprocess()
   )
   testing_loader = torch.utils.data.DataLoader(
     test_data, batch_size=2, shuffle=False, num_workers=1
@@ -808,7 +811,7 @@ if __name__ == "__main__":
       help="Whether to turn on l0 MSE"
   )
   parser.add_argument(
-      "--load_weights", default="",
+      "--load_weights", default="train/1599.ckpt",
       help="Loaded weights")
   parser.add_argument(
       "--gpu_ids", type=str,default="0",

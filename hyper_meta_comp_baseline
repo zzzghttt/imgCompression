@@ -64,7 +64,8 @@ class Preprocess(object):
     img /= 127.5
     img -= 1.0
     return img.transpose((2, 0, 1))
-    
+
+#没用到
 def quantize_image(img):
   img = torch.clamp(img, -1, 1)
   img += 1
@@ -106,6 +107,7 @@ class synthesisTransformModel(nn.Module):
     x = self.transform(inputs)
     return x
 
+#没用到
 class Space2Depth(nn.Module):
   def __init__(self, r):
     super(Space2Depth, self).__init__()
@@ -121,6 +123,7 @@ class Space2Depth(nn.Module):
     x_prime = x_view.permute(0,3,5,1,2,4).contiguous().view(b, out_c, out_h, out_w)
     return x_prime
 
+#没用到
 class Depth2Space(nn.Module):
   def __init__(self, r):
     super(Depth2Space, self).__init__()
@@ -187,10 +190,11 @@ class BlockSample(nn.Module):
   def forward(self, inputs):
     t = F.conv2d(inputs, self.sample_filter, padding=3)
     b, c, h, w = inputs.size()
-    t = t.contiguous().view(b, c, 4, 4, h, w).permute(0, 4, 5, 1, 2, 3)
+    t = t.contiguous().view(b, c, 4, 4, h, w).permute(0, 4, 5, 1, 2, 3)     #变换形状
     t = t.contiguous().view(b*h*w, c, 4, 4)
     return t
 
+#没用到
 class NeighborSample(nn.Module):
   def __init__(self, in_shape):
     super(NeighborSample, self).__init__()
@@ -233,7 +237,8 @@ class GaussianModel(nn.Module):
     likelihood_bound = 1e-8
     likelihood = torch.clamp(likelihood, min=likelihood_bound)
     return likelihood
-    
+
+
 class PredictionModel_Context(nn.Module):
   def __init__(self, in_dim, dim=192, trainable=True, outdim=None):
     super(PredictionModel_Context, self).__init__()
@@ -273,22 +278,22 @@ class PredictionModel(nn.Module):
       outdim = dim
     self.transform = nn.Sequential(
       nn.Conv2d(in_dim, dim, 3, 1, 1),
-      nn.LeakyReLU(0.2),
+      nn.LeakyReLU(0.2),                  # ReLU是将所有的负值都设为零，相反，Leaky ReLU是给所有负值赋予一个非零斜率
       nn.Conv2d(dim, dim, 3, 2, 1),
       nn.LeakyReLU(0.2),
       nn.Conv2d(dim, dim, 3, 1, 1),
       nn.LeakyReLU(0.2)
     )
-    self.fc = nn.Linear(dim*2*2, outdim)
-    self.flatten = nn.Flatten()
+    self.fc = nn.Linear(dim*2*2, outdim)      #设置全连接层：nn.Linear(输入的二维张量大小，输出的二维张量大小)
+    self.flatten = nn.Flatten()             #张量扁平化，传递给全连接层的卷积层的输出必须在全连接层接受输入之前进行flatten
     
   def forward(self, y_shape, h_tilde, h_sampler):
     b, c, h, w = y_shape
     h_sampled = h_sampler(h_tilde)
     merged = h_sampled
     y_context = self.transform(merged)
-    y_context = self.flatten(y_context)
-    y_context = self.fc(y_context)
+    y_context = self.flatten(y_context)     #调用张量扁平化
+    y_context = self.fc(y_context)          #调用全连接层
     hyper_mu = y_context[:, :c]
     hyper_mu = hyper_mu.view(b, h, w, c).permute(0, 3, 1, 2)
     hyper_sigma = y_context[:, c:]
@@ -298,6 +303,7 @@ class PredictionModel(nn.Module):
     return hyper_mu, hyper_sigma
 
 
+#暂时没用到这个函数
 class conv_generator(nn.Module):
     def __init__(self,in_dim,out_dim):
         super(conv_generator,self).__init__()
@@ -351,11 +357,12 @@ class Net(nn.Module):
 
     self.register_parameter('z2_sigma', self.v_z2_sigma)
 
-    self.prediction_model_no_context = PredictionModel(in_dim=192, dim=192, outdim=384)
-    
-    # self.y_sampler = BlockSample((b,192,h//8,w//8))
+    self.prediction_model = PredictionModel_Context(in_dim=192 + 192, dim=192, outdim=192 * 2)
+    # self.prediction_model_no_context = PredictionModel(in_dim=192, dim=192, outdim=384)
+
+    self.y_sampler = BlockSample((b,192,h//8,w//8))
     self.h_sampler = BlockSample((b, 192,h//8,w//8), False)
-    # self.test_y_sampler = BlockSample((b,192,h//8,w//8))
+    self.test_y_sampler = BlockSample((b,192,h//8,w//8))
     self.test_h_sampler = BlockSample((b,192,h//8,w//8), False)
 
 
@@ -365,9 +372,9 @@ class Net(nn.Module):
     
     z3 = self.a_model(inputs)
 
-    noise = torch.rand_like(z3) - 0.5
-    z3_noisy = z3 + noise
-    z3_rounded = bypass_round(z3)
+    noise = torch.rand_like(z3) - 0.5     #返回一个与输入大小相同的张量，该张量由区间[0，1)上均匀分布的随机数填充，这里生成[-0.5,0.5]的均匀分布
+    z3_noisy = z3 + noise               #加噪声
+    z3_rounded = bypass_round(z3)       #舍入
 
     z2 = self.ha_model(z3_rounded)
     
@@ -378,18 +385,19 @@ class Net(nn.Module):
     h2 = self.hs_model(z2_rounded)
     
     z2_sigma = self.z2_sigma.cuda()
-    z2_mu = torch.zeros_like(z2_sigma)
+    z2_mu = torch.zeros_like(z2_sigma)    #返回一个与输入大小相同的张量，该张量由0填充
 
     if mode == 'train':
-      z2_likelihoods = self.entropy_bottleneck_z2(z2_noisy, z2_sigma, z2_mu)
+      z2_likelihoods = self.entropy_bottleneck_z2(z2_noisy, z2_sigma, z2_mu)            #用于算test的bpp
       
-      # z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.y_sampler, self.h_sampler)
-      z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.h_sampler)
-      z3_likelihoods = self.entropy_bottleneck_z3(z3_noisy, z3_sigma, z3_mu)
+      z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.y_sampler, self.h_sampler)
+      # z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.h_sampler)     #从h2预测σ
+      z3_likelihoods = self.entropy_bottleneck_z3(z3_noisy, z3_sigma, z3_mu)            #用于算train的bpp
     else:
       z2_likelihoods = self.entropy_bottleneck_z2(z2_rounded, z2_sigma, z2_mu)
-      # z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.test_y_sampler, self.test_h_sampler)
-      z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.test_h_sampler)
+
+      z3_mu, z3_sigma = self.prediction_model(z3_rounded, h2, self.test_y_sampler, self.test_h_sampler)
+      # z3_mu, z3_sigma = self.prediction_model_no_context(z3_rounded.shape, h2,  self.test_h_sampler)
       z3_likelihoods = self.entropy_bottleneck_z3(z3_rounded, z3_sigma, z3_mu)
 
     x_tilde = self.s_model(z3_rounded)
@@ -473,10 +481,10 @@ def train():
 
   net = Net((args.batchsize,256,256,3), (2,256,256,3)).to(device)
   def weight_init(m):
-    if isinstance(m, nn.Linear):
-        nn.init.xavier_uniform_(m.weight)
-        nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Conv2d):
+    if isinstance(m, nn.Linear):           #判断m是否为linear
+        nn.init.xavier_uniform_(m.weight)  #初始化weight为均匀分布
+        nn.init.constant_(m.bias, 0)        #初始化bias为常数0
+    elif isinstance(m, nn.Conv2d):          #判断是否是Conv2d（二维卷积）
         nn.init.xavier_uniform_(m.weight)
         nn.init.constant_(m.bias, 0)
   
@@ -492,9 +500,10 @@ def train():
   # sch = optim.lr_scheduler.MultiStepLR(opt, [4000, 4500, 4750, 5000], 0.5)
   # opt = optim.Adam(net.parameters(), lr=1e-4)
   # sch = optim.lr_scheduler.MultiStepLR(opt, [600, 800, 1000, 1100], 0.5)
-  opt = optim.Adam(net.parameters(), lr=1e-4)
+
+  opt = optim.Adam(net.parameters(), lr=1e-4)          #optim.Adam优化函数（被优化的参数，lr=学习速率）这里将net模型中的全部参数进行优化
   sch = optim.lr_scheduler.MultiStepLR(opt, [100], 0.5)
-  for epoch in range(1500,1600):
+  for epoch in range(1500,1700):
     # net.train()
     start_time = time.time()
 
@@ -506,15 +515,15 @@ def train():
     
     for i, data in enumerate(training_loader, 0):
 
-      x = data.to(device)
-      opt.zero_grad()
+      x = data.to(device)     #训练数据data赋值到x，之后的操作在device即gpu上做
+      opt.zero_grad()         #这里是否可以改成梯度累加？
       train_loss, train_bpp, train_mse = net(x, 'train')
 
       train_loss = train_loss.mean()
       train_bpp = train_bpp.mean()
       train_mse = train_mse.mean()
 
-      if np.isnan(train_loss.item()):
+      if np.isnan(train_loss.item()):       #判断变量或数组里是否有NaN
         raise Exception('NaN in loss')
 
       list_train_loss += train_loss.item()
@@ -566,9 +575,11 @@ def val():
   TUNE_ITERS = 50
   LR = 1e-4
 
-
   test_data = KodakDataset(
-    'kodak/*.png', Preprocess()
+    'kodak/*.png', transform=tv.transforms.Compose([
+      tv.transforms.RandomCrop(256),
+      Preprocess()
+    ])
   )
   testing_loader = torch.utils.data.DataLoader(
     test_data, batch_size=2, shuffle=False, num_workers=1
@@ -657,7 +668,7 @@ def test_kodak():
   device = torch.device('cuda:'+args.gpu_ids)
   TUNE_ITERS = 100
 
-  Kodak_path = "images"
+  Kodak_path = "kodak"
   
  
   net = Net((args.batchsize,256,256,3), (8,256,256,3)).to(device)
@@ -784,7 +795,7 @@ if __name__ == "__main__":
       "--checkpoint_dir", default="train",
       help="Directory where to save/load model checkpoints.")
   parser.add_argument(
-      "--train_glob", default="images/*.png",
+      "--train_glob", default="DIV/X2/*.png",
       help="Glob pattern identifying training data. This pattern must expand "
            "to a list of RGB images in PNG format.")
   parser.add_argument(
@@ -811,7 +822,7 @@ if __name__ == "__main__":
       help="Whether to turn on l0 MSE"
   )
   parser.add_argument(
-      "--load_weights", default="train/1599.ckpt",
+      "--load_weights", default="train/p1549.ckpt",
       help="Loaded weights")
   parser.add_argument(
       "--gpu_ids", type=str,default="0",
